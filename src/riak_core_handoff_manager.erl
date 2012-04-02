@@ -60,16 +60,18 @@
           vnode_pid     :: pid() | undefined
         }).
 -type handoff_status() :: #handoff_status{}.
+-type handoffs() :: [handoff_status()].
 
 -record(repair,
         { partition :: index(),
-          hs :: handoff_status()
+          minus_one_hs :: handoff_status(),
+          plus_one_hs :: handoff_status()
         }).
 -type repair() :: #repair{}.
 
 -record(state,
         { excl,
-          handoffs :: [handoff_status()],
+          handoffs :: handoffs(),
           repairs :: [repair()]
         }).
 
@@ -123,7 +125,7 @@ handle_call({get_exclusions, Module}, _From, State=#state{excl=Excl}) ->
     Reply =  [I || {M, I} <- ordsets:to_list(Excl), M =:= Module],
     {reply, {ok, Reply}, State};
 handle_call({add_outbound,Mod,Idx,Node,Pid},_From,State=#state{handoffs=HS}) ->
-    case send_handoff(Mod,Idx,Node,Pid,HS) of
+    case send_handoff(Mod, {Idx, Idx}, Node, Pid, HS) of
         {ok,Handoff=#handoff_status{transport_pid=Sender}} ->
             {reply,{ok,Sender},State#state{handoffs=HS ++ [Handoff]}};
         {false,_ExistingHandoff=#handoff_status{transport_pid=Sender}} ->
@@ -143,13 +145,25 @@ handle_call({add_repair, Partition}, _From, State=#state{handoffs=HS,
                                                          repairs=RS}) ->
     case get_repair(Partition, RS) of
         none ->
-            start_repair,
-            RS2 = RS ++ [#repair{partition=Partition, hs=dummy}],
+            Repair = repair(Partition, HS),
+            RS2 = RS ++ [Repair],
             State2 = State#state{repairs=RS2},
             lager:info("add_repair ~p/~p", [node(), Partition]),
             {reply, ok, State2};
         #repair{} ->
             {reply, repair_in_progress, State}
+    end;
+
+handle_call({send_handoff, Mod, {Src, Target}, Node, {CH, NValMap}},
+            _From,
+            State=#state{handoffs=HS}) ->
+    Filter = riak_search_utils:repair_filter(Target, CH, NValMap),
+    {ok, SrcPid} = riak_core_vnode_manager:get_vnode_pid(Src, riak_search_vnode),
+    case send_handoff(Mod, {Src, Target}, Node, Filter, SrcPid, HS) of
+        {ok, Handoff} ->
+            {reply, {ok, Handoff}, State#state{handoffs=HS ++ [Handoff]}};
+        {false, Handoff} ->
+            {reply, {ok, Handoff}, State}
     end;
 
 handle_call(status,_From,State=#state{handoffs=HS}) ->
@@ -259,14 +273,58 @@ handoff_concurrency_limit_reached () ->
     ActiveSenders=proplists:get_value(active,Senders),
     get_concurrency_limit() =< (ActiveReceivers + ActiveSenders).
 
+%% @doc Initiate the repair handoffs for the given `Partition'.
+-spec repair(index(), handoffs()) -> repair().
+repair(Partition, HS) ->
+    {ok, Ring} = riak_core_ring_manager:get_raw_ring(),
+    CH = element(4, Ring),
+    NValMap = [{S:name(), S:n_val()} ||
+                  S <- riak_search_config:get_all_schemas()],
+    [_, {_PMinusOne, _PMinusOneNode}=MOne] =
+        chash:predecessors(<<Partition:160/integer>>, CH, 2),
+    [{_PPlusOne, _PPlusOneNode}=POne] =
+        chash:successors(<<Partition:160/integer>>, CH, 1),
+    MinusOneHS = repair_handoff(MOne, Partition, {CH, NValMap}, HS),
+    PlusOneHS = repair_handoff(POne, Partition, {CH, NValMap}, HS),
+    #repair{partition=Partition, minus_one_hs=MinusOneHS, plus_one_hs=PlusOneHS}.
+
+%% @private
+%%
+%% @doc Initiate a repair handoff from `Src' to `Target'.  Return the
+%% `handoff_status' entry.
+%%
+%% TODO: return {local|remote, HS}?
+-spec repair_handoff({index(), node()}, index(),
+                     {chash:chash(), list()}, handoffs()) ->
+                            {ok, handoff_status()}.
+repair_handoff({Src, SrcOwner}, Target, {CH, NValMap}, HS) ->
+    case SrcOwner == node() of
+        true ->
+            {ok, SrcPid} = riak_core_vnode_manager:get_vnode_pid(Src,
+                                                                 riak_search_vnode),
+            Filter = riak_search_utils:repair_filter(Target, CH, NValMap),
+            {ok, Handoff} = send_handoff(riak_search_vnode, {Src, Target},
+                                         node(), Filter, SrcPid, HS),
+            {ok, Handoff};
+        false ->
+            {ok, Handoff} = gen_server:call({?MODULE, SrcOwner},
+                                            {send_handoff, riak_search_vnode,
+                                             {Src, Target}, node(),
+                                             {CH, NValMap}}),
+            {ok, Handoff}
+    end.
+
+send_handoff(Mod, {Src, Target}, Node, Vnode, HS) ->
+    send_handoff(Mod, {Src, Target}, Node, Vnode, none, HS).
+
 %% spawn a sender process
-send_handoff (Mod,Idx,Node,Vnode,HS) ->
+send_handoff(Mod, {Src, Target}, Node, Filter, Vnode, HS) ->
     case handoff_concurrency_limit_reached() of
         true ->
             {error, max_concurrency};
         false ->
             ShouldHandoff=
-                case lists:keyfind({Mod,Idx},#handoff_status.modindex,HS) of
+                case lists:keyfind({Mod, Target},#handoff_status.modindex,HS) of
                     false ->
                         true;
                     Handoff=#handoff_status{node=Node,vnode_pid=Vnode} ->
@@ -284,7 +342,8 @@ send_handoff (Mod,Idx,Node,Vnode,HS) ->
                     %% start the sender process
                     {ok,Pid}=riak_core_handoff_sender_sup:start_sender(Node,
                                                                        Mod,
-                                                                       {Idx, Idx},
+                                                                       {Src, Target},
+                                                                       Filter,
                                                                        Vnode),
                     erlang:monitor(process,Pid),
 
@@ -293,7 +352,7 @@ send_handoff (Mod,Idx,Node,Vnode,HS) ->
                                           direction=outbound,
                                           timestamp=now(),
                                           node=Node,
-                                          modindex={Mod,Idx},
+                                          modindex={Mod, Target},
                                           vnode_pid=Vnode,
                                           status=[]
                                         }
