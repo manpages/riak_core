@@ -57,7 +57,8 @@
           transport_pid :: pid(),
           timestamp     :: tuple(),
           status        :: any(),
-          vnode_pid     :: pid() | undefined
+          vnode_pid     :: pid() | undefined,
+          origin        :: term()
         }).
 -type handoff_status() :: #handoff_status{}.
 -type handoffs() :: [handoff_status()].
@@ -68,6 +69,7 @@
           plus_one_hs :: handoff_status()
         }).
 -type repair() :: #repair{}.
+-type repairs() :: [repair()].
 
 -record(state,
         { excl,
@@ -159,7 +161,7 @@ handle_call({send_handoff, Mod, {Src, Target}, Node, {CH, NValMap}},
             State=#state{handoffs=HS}) ->
     Filter = riak_search_utils:repair_filter(Target, CH, NValMap),
     {ok, SrcPid} = riak_core_vnode_manager:get_vnode_pid(Src, riak_search_vnode),
-    case send_handoff(Mod, {Src, Target}, Node, Filter, SrcPid, HS) of
+    case send_handoff(Mod, {Src, Target}, Node, Filter, SrcPid, HS, Node) of
         {ok, Handoff} ->
             {reply, {ok, Handoff}, State#state{handoffs=HS ++ [Handoff]}};
         {false, Handoff} ->
@@ -200,11 +202,28 @@ handle_cast({add_exclusion, {Mod, Idx}}, State=#state{excl=Excl}) ->
     end,
     {noreply, State#state{excl=ordsets:add_element({Mod, Idx}, Excl)}}.
 
+handle_info({handoff_finished, {_Mod, Target}, Handoff, _Reason},
+            State=#state{repairs=RS}) ->
+    %% NOTE: this msg will only come in for repair handoff
+    R2 = case get_repair(Target, RS) of
+             #repair{partition=Target, minus_one_hs=MO, plus_one_hs=PO}=R ->
+                 if MO == Handoff -> R#repair{minus_one_hs=completed};
+                    PO == Handoff -> R#repair{plus_one_hs=completed};
+                    true -> throw({finished_handoff_matches_none, R, Handoff})
+                 end
+         end,
+    case R2 of
+        #repair{minus_one_hs=completed, plus_one_hs=completed} ->
+            {noreply, State#state{repairs=remove_repair(R2, RS)}};
+        _ ->
+            {noreply, State#state{repairs=replace_repair(R2, RS)}}
+    end;
 
-handle_info({'DOWN',_Ref,process,Pid,Reason},State=#state{handoffs=HS}) ->
+handle_info({'DOWN', _Ref, process, Pid, Reason}, State=#state{handoffs=HS}) ->
     case lists:keytake(Pid,#handoff_status.transport_pid,HS) of
         {value,
-         #handoff_status{modindex={M,I},direction=Dir,vnode_pid=Vnode},
+         #handoff_status{modindex={M,I},direction=Dir,vnode_pid=Vnode,
+                         origin=Origin}=Handoff,
          NewHS
         } ->
             WarnVnode =
@@ -228,6 +247,13 @@ handle_info({'DOWN',_Ref,process,Pid,Reason},State=#state{handoffs=HS}) ->
                     riak_core_vnode:handoff_error(Vnode,'DOWN',Reason);
                 _ ->
                     ok
+            end,
+
+            case Origin of
+                none -> ok;
+                local -> self() ! {handoff_finished, {M, I}, Handoff, Reason};
+                _ -> {?MODULE, Origin} ! {handoff_finished, {M, I},
+                                          Handoff, Reason}
             end,
 
             %% removed the handoff from the list of active handoffs
@@ -258,12 +284,27 @@ get_concurrency_limit () ->
 %%
 %% @doc Get the corresponding repair entry in `Repairs', if one
 %% exists, for the given `Partition'.
--spec get_repair(index(), [repair()]) -> repair() | none.
+-spec get_repair(index(), repairs()) -> repair() | none.
 get_repair(Partition, Repairs) ->
     case lists:keyfind(Partition, #repair.partition, Repairs) of
         false -> none;
         Val -> Val
     end.
+
+%% @private
+%%
+%% @doc Remove the repair entry.
+-spec remove_repair(repair(), repairs()) -> repairs().
+remove_repair(Repair, Repairs) ->
+    lists:keydelete(Repair#repair.partition, #repair.partition, Repairs).
+
+%% @private
+%%
+%% @doc Replace the matching repair entry with `Repair'.
+-spec replace_repair(repair(), repairs()) -> repairs().
+replace_repair(Repair, Repairs) ->
+    lists:keyreplace(Repair#repair.partition, #repair.partition,
+                     Repairs, Repair).
 
 %% true if handoff_concurrency (inbound + outbound) hasn't yet been reached
 handoff_concurrency_limit_reached () ->
@@ -294,6 +335,8 @@ repair(Partition, HS) ->
 %% `handoff_status' entry.
 %%
 %% TODO: return {local|remote, HS}?
+%%
+%% NOTE: This function assumes it runs on the owner of `Target'.
 -spec repair_handoff({index(), node()}, index(),
                      {chash:chash(), list()}, handoffs()) ->
                             {ok, handoff_status()}.
@@ -304,21 +347,25 @@ repair_handoff({Src, SrcOwner}, Target, {CH, NValMap}, HS) ->
                                                                  riak_search_vnode),
             Filter = riak_search_utils:repair_filter(Target, CH, NValMap),
             {ok, Handoff} = send_handoff(riak_search_vnode, {Src, Target},
-                                         node(), Filter, SrcPid, HS),
-            {ok, Handoff};
+                                         node(), Filter, SrcPid, HS, node()),
+            Handoff;
         false ->
             {ok, Handoff} = gen_server:call({?MODULE, SrcOwner},
                                             {send_handoff, riak_search_vnode,
                                              {Src, Target}, node(),
                                              {CH, NValMap}}),
-            {ok, Handoff}
+            Handoff
     end.
 
 send_handoff(Mod, {Src, Target}, Node, Vnode, HS) ->
-    send_handoff(Mod, {Src, Target}, Node, Vnode, none, HS).
+    send_handoff(Mod, {Src, Target}, Node, Vnode, none, HS, none).
 
-%% spawn a sender process
-send_handoff(Mod, {Src, Target}, Node, Filter, Vnode, HS) ->
+%% @private
+%%
+%% @doc Start a handoff sender to transfer data from `Src' to `Target'.
+%%
+%% NOTE: `Origin' should be `none' for non-repair handoff.
+send_handoff(Mod, {Src, Target}, Node, Filter, Vnode, HS, Origin) ->
     case handoff_concurrency_limit_reached() of
         true ->
             {error, max_concurrency};
@@ -354,7 +401,8 @@ send_handoff(Mod, {Src, Target}, Node, Filter, Vnode, HS) ->
                                           node=Node,
                                           modindex={Mod, Target},
                                           vnode_pid=Vnode,
-                                          status=[]
+                                          status=[],
+                                          origin=Origin
                                         }
                     };
 
@@ -379,7 +427,8 @@ receive_handoff (SSLOpts) ->
                                   timestamp=now(),
                                   modindex={undefined,undefined},
                                   node=undefined,
-                                  status=[]
+                                  status=[],
+                                  origin=none
                                 }
             }
     end.
