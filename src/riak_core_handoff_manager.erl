@@ -80,7 +80,7 @@ start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 init([]) ->
-    {ok, #state{excl=ordsets:new(), handoffs=[]}}.
+    {ok, #state{excl=ordsets:new(), handoffs=[], repairs=[]}}.
 
 %% handoff_manager API
 
@@ -144,7 +144,8 @@ handle_call({add_repair, Partition}, _From, State=#state{handoffs=HS,
     case get_repair(Partition, RS) of
         none ->
             start_repair,
-            State2 = State,
+            RS2 = RS ++ [#repair{partition=Partition, hs=dummy}],
+            State2 = State#state{repairs=RS2},
             lager:info("add_repair ~p/~p", [node(), Partition]),
             {reply, ok, State2};
         #repair{} ->
@@ -244,8 +245,11 @@ get_concurrency_limit () ->
 %% @doc Get the corresponding repair entry in `Repairs', if one
 %% exists, for the given `Partition'.
 -spec get_repair(index(), [repair()]) -> repair() | none.
-get_repair(_Partition, _Repairs) ->
-    none.
+get_repair(Partition, Repairs) ->
+    case lists:keyfind(Partition, #repair.partition, Repairs) of
+        false -> none;
+        Val -> Val
+    end.
 
 %% true if handoff_concurrency (inbound + outbound) hasn't yet been reached
 handoff_concurrency_limit_reached () ->
