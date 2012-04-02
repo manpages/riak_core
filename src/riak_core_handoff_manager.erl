@@ -35,6 +35,7 @@
 %% handoff api
 -export([add_outbound/4,
          add_inbound/1,
+         add_repair/1,
          status/0,
          set_concurrency/1,
          kill_handoffs/0
@@ -58,10 +59,18 @@
           status        :: any(),
           vnode_pid     :: pid() | undefined
         }).
+-type handoff_status() :: #handoff_status{}.
+
+-record(repair,
+        { partition :: index(),
+          hs :: handoff_status()
+        }).
+-type repair() :: #repair{}.
 
 -record(state,
         { excl,
-          handoffs :: [#handoff_status{}]
+          handoffs :: [handoff_status()],
+          repairs :: [repair()]
         }).
 
 %% this can be overridden with riak_core handoff_concurrency
@@ -80,6 +89,15 @@ add_outbound(Module,Idx,Node,VnodePid) ->
 
 add_inbound(SSLOpts) ->
     gen_server:call(?MODULE,{add_inbound,SSLOpts}).
+
+%% @doc Add a repair request for the given `Partition'.
+-spec add_repair(index()) -> ok | repair_in_progress.
+add_repair(Partition) ->
+    %% Fwd the repair req to the partition's owner to guarentee that
+    %% there is only one req per partition.
+    {ok, Ring} = riak_core_ring_manager:get_raw_ring(),
+    Owner = riak_core_ring:index_owner(Ring, Partition),
+    gen_server:call({?MODULE, Owner}, {add_repair, Partition}).
 
 status() ->
     gen_server:call(?MODULE,status).
@@ -120,6 +138,19 @@ handle_call({add_inbound,SSLOpts},_From,State=#state{handoffs=HS}) ->
         Error ->
             {reply,Error,State}
     end;
+
+handle_call({add_repair, Partition}, _From, State=#state{handoffs=HS,
+                                                         repairs=RS}) ->
+    case get_repair(Partition, RS) of
+        none ->
+            start_repair,
+            State2 = State,
+            lager:info("add_repair ~p/~p", [node(), Partition]),
+            {reply, ok, State2};
+        #repair{} ->
+            {reply, repair_in_progress, State}
+    end;
+
 handle_call(status,_From,State=#state{handoffs=HS}) ->
     Handoffs=[{M,N,D,active,S} ||
                  #handoff_status{modindex=M,node=N,direction=D,status=S} <- HS],
@@ -207,6 +238,14 @@ code_change(_OldVsn, State, _Extra) ->
 
 get_concurrency_limit () ->
     app_helper:get_env(riak_core,handoff_concurrency,?HANDOFF_CONCURRENCY).
+
+%% @private
+%%
+%% @doc Get the corresponding repair entry in `Repairs', if one
+%% exists, for the given `Partition'.
+-spec get_repair(index(), [repair()]) -> repair() | none.
+get_repair(_Partition, _Repairs) ->
+    none.
 
 %% true if handoff_concurrency (inbound + outbound) hasn't yet been reached
 handoff_concurrency_limit_reached () ->
