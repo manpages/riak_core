@@ -246,14 +246,13 @@ handle_info({'DOWN', _Ref, process, Pid, Reason}, State=#state{handoffs=HS}) ->
                 true ->
                     riak_core_vnode:handoff_error(Vnode,'DOWN',Reason);
                 _ ->
+                    case Origin of
+                        none -> ok;
+                        local -> self() ! {handoff_finished, {M, I}, Handoff, Reason};
+                        _ -> {?MODULE, Origin} ! {handoff_finished, {M, I},
+                                                  Handoff, Reason}
+                    end,
                     ok
-            end,
-
-            case Origin of
-                none -> ok;
-                local -> self() ! {handoff_finished, {M, I}, Handoff, Reason};
-                _ -> {?MODULE, Origin} ! {handoff_finished, {M, I},
-                                          Handoff, Reason}
             end,
 
             %% removed the handoff from the list of active handoffs

@@ -182,10 +182,8 @@ start_fold(TargetNode, Module, {SrcPartition, TargetPartition},
          end
      catch
          exit:{shutdown,max_concurrency} ->
-             %% In this case the receiver hungup on the sender because
-             %% of handoff_concurrency.  You don't want to log
-             %% anything because this is normal.
-             ok;
+             %% Need to fwd the error so the handoff mgr knows
+             exit({shutdown, max_concurrency});
          exit:{shutdown, timeout} ->
              %% A receive timeout during handoff
              riak_core_stat:update(handoff_timeouts),
