@@ -51,7 +51,7 @@
 -type index() :: integer().
 
 -record(handoff_status,
-        { modindex      :: {mod(),index()},
+        { mod_src_tgt   :: {mod(), index(), index()},
           node          :: atom(),
           direction     :: inbound | outbound,
           transport_pid :: pid(),
@@ -125,22 +125,24 @@ get_exclusions(Module) ->
 
 handle_call({get_exclusions, Module}, _From, State=#state{excl=Excl}) ->
     Reply =  [I || {M, I} <- ordsets:to_list(Excl), M =:= Module],
-    {reply, {ok, Reply}, State};
+    {reply, {ok, Reply}, State, timeout()};
 handle_call({add_outbound,Mod,Idx,Node,Pid},_From,State=#state{handoffs=HS}) ->
     case send_handoff(Mod, {Idx, Idx}, Node, Pid, HS) of
         {ok,Handoff=#handoff_status{transport_pid=Sender}} ->
-            {reply,{ok,Sender},State#state{handoffs=HS ++ [Handoff]}};
+            {reply,{ok,Sender},State#state{handoffs=HS ++ [Handoff]},
+             timeout()};
         {false,_ExistingHandoff=#handoff_status{transport_pid=Sender}} ->
-            {reply,{ok,Sender},State};
+            {reply,{ok,Sender},State, timeout()};
         Error ->
-            {reply,Error,State}
+            {reply,Error,State, timeout()}
     end;
 handle_call({add_inbound,SSLOpts},_From,State=#state{handoffs=HS}) ->
     case receive_handoff(SSLOpts) of
         {ok,Handoff=#handoff_status{transport_pid=Receiver}} ->
-            {reply,{ok,Receiver},State#state{handoffs=HS ++ [Handoff]}};
+            {reply,{ok,Receiver},State#state{handoffs=HS ++ [Handoff]},
+             timeout()};
         Error ->
-            {reply,Error,State}
+            {reply,Error,State, timeout()}
     end;
 
 handle_call({add_repair, Partition}, _From, State=#state{handoffs=HS,
@@ -151,9 +153,9 @@ handle_call({add_repair, Partition}, _From, State=#state{handoffs=HS,
             RS2 = RS ++ [Repair],
             State2 = State#state{repairs=RS2},
             lager:info("add_repair ~p/~p", [node(), Partition]),
-            {reply, ok, State2};
+            {reply, ok, State2, timeout()};
         #repair{} ->
-            {reply, repair_in_progress, State}
+            {reply, repair_in_progress, State, timeout()}
     end;
 
 handle_call({send_handoff, Mod, {Src, Target}, Node, {CH, NValMap}},
@@ -163,15 +165,16 @@ handle_call({send_handoff, Mod, {Src, Target}, Node, {CH, NValMap}},
     {ok, SrcPid} = riak_core_vnode_manager:get_vnode_pid(Src, riak_search_vnode),
     case send_handoff(Mod, {Src, Target}, Node, Filter, SrcPid, HS, Node) of
         {ok, Handoff} ->
-            {reply, {ok, Handoff}, State#state{handoffs=HS ++ [Handoff]}};
+            {reply, {ok, Handoff}, State#state{handoffs=HS ++ [Handoff]},
+             timeout()};
         {false, Handoff} ->
-            {reply, {ok, Handoff}, State}
+            {reply, {ok, Handoff}, State, timeout()}
     end;
 
 handle_call(status,_From,State=#state{handoffs=HS}) ->
     Handoffs=[{M,N,D,active,S} ||
-                 #handoff_status{modindex=M,node=N,direction=D,status=S} <- HS],
-    {reply, Handoffs, State};
+                 #handoff_status{mod_src_tgt={M,_,_I},node=N,direction=D,status=S} <- HS],
+    {reply, Handoffs, State, timeout()};
 handle_call({set_concurrency,Limit},_From,State=#state{handoffs=HS}) ->
     application:set_env(riak_core,handoff_concurrency,Limit),
     case Limit < erlang:length(HS) of
@@ -183,14 +186,15 @@ handle_call({set_concurrency,Limit},_From,State=#state{handoffs=HS}) ->
             {_Keep,Discard}=lists:split(Limit,HS),
             [erlang:exit(Pid,max_concurrency) ||
                 #handoff_status{transport_pid=Pid} <- Discard],
-            {reply, ok, State};
+            {reply, ok, State, timeout()};
         false ->
-            {reply, ok, State}
+            {reply, ok, State, timeout()}
     end.
 
 
 handle_cast({del_exclusion, {Mod, Idx}}, State=#state{excl=Excl}) ->
-    {noreply, State#state{excl=ordsets:del_element({Mod, Idx}, Excl)}};
+    {noreply, State#state{excl=ordsets:del_element({Mod, Idx}, Excl)},
+     timeout()};
 handle_cast({add_exclusion, {Mod, Idx}}, State=#state{excl=Excl}) ->
     {ok, Ring} = riak_core_ring_manager:get_raw_ring(),
     case riak_core_ring:my_indices(Ring) of
@@ -200,29 +204,85 @@ handle_cast({add_exclusion, {Mod, Idx}}, State=#state{excl=Excl}) ->
         _ ->
             ok
     end,
-    {noreply, State#state{excl=ordsets:add_element({Mod, Idx}, Excl)}}.
+    {noreply, State#state{excl=ordsets:add_element({Mod, Idx}, Excl)},
+     timeout()}.
+
+handle_info(timeout, State=#state{handoffs=HS,  repairs=RS}) ->
+    case RS of
+        [] ->
+            {noreply, State, timeout()};
+        _ ->
+            R = hd(RS),
+            MO = R#repair.minus_one_hs,
+            PO = R#repair.plus_one_hs,
+            {ok, Ring} = riak_core_ring_manager:get_raw_ring(),
+            CH = element(4, Ring),
+            NValMap = [{S:name(), S:n_val()} ||
+                          S <- riak_search_config:get_all_schemas()],
+
+            if MO#handoff_status.status == needs_retry ->
+                    {_M, Src, Target} = MO#handoff_status.mod_src_tgt,
+                    SrcOwner = riak_core_ring:index_owner(Ring, Src),
+                    MOHS = repair_handoff({Src, SrcOwner}, Target, {CH, NValMap}, HS),
+                    R2 = R#repair{minus_one_hs=MOHS},
+                    RS2 = replace_repair(R2, RS),
+                    {noreply, State#state{handoffs=HS ++ [MOHS], repairs=RS2}, timeout()};
+               true ->
+                    if PO#handoff_status.status == needs_retry ->
+                            {_M, Src, Target} = PO#handoff_status.mod_src_tgt,
+                            SrcOwner = riak_core_ring:index_owner(Ring, Src),
+                            POHS = repair_handoff({Src, SrcOwner}, Target, {CH, NValMap}, HS),
+                            R2 = R#repair{plus_one_hs=POHS},
+                            RS2 = replace_repair(R2, RS),
+                            {noreply, State#state{handoffs=HS ++ [POHS], repairs=RS2},
+                             timeout()};
+                       true ->
+                            {noreply, State, timeout()}
+                    end
+            end
+    end;
+
+handle_info({handoff_failed, {_Mod, Target}, Handoff, _Reason},
+            State=#state{repairs=RS}) ->
+    R2 = case get_repair(Target, RS) of
+             #repair{partition=Target, minus_one_hs=MO, plus_one_hs=PO}=R ->
+                 if MO == Handoff ->
+                         MO2 = MO#handoff_status{status=needs_retry},
+                         R#repair{minus_one_hs=MO2};
+                    PO == Handoff ->
+                         PO2 = PO#handoff_status{status=needs_retry},
+                         R#repair{plus_one_hs=PO2};
+                    true -> throw({handoff_failed_matches_none, RS, Handoff})
+                 end
+         end,
+    {noreply, State#state{repairs=replace_repair(R2, RS)}, timeout()};
 
 handle_info({handoff_finished, {_Mod, Target}, Handoff, _Reason},
             State=#state{repairs=RS}) ->
     %% NOTE: this msg will only come in for repair handoff
     R2 = case get_repair(Target, RS) of
              #repair{partition=Target, minus_one_hs=MO, plus_one_hs=PO}=R ->
-                 if MO == Handoff -> R#repair{minus_one_hs=completed};
-                    PO == Handoff -> R#repair{plus_one_hs=completed};
-                    true -> throw({finished_handoff_matches_none, R, Handoff})
+                 if MO == Handoff ->
+                         MO2 = MO#handoff_status{status=completed},
+                         R#repair{minus_one_hs=MO2};
+                    PO == Handoff ->
+                         PO2 = PO#handoff_status{status=completed},
+                         R#repair{plus_one_hs=PO2};
+                    true -> throw({handoff_finished_matches_none, RS, Handoff})
                  end
          end,
-    case R2 of
-        #repair{minus_one_hs=completed, plus_one_hs=completed} ->
-            {noreply, State#state{repairs=remove_repair(R2, RS)}};
+    case {R2#repair.minus_one_hs#handoff_status.status,
+          R2#repair.plus_one_hs#handoff_status.status} of
+        {completed, completed} ->
+            {noreply, State#state{repairs=remove_repair(R2, RS)}, timeout()};
         _ ->
-            {noreply, State#state{repairs=replace_repair(R2, RS)}}
+            {noreply, State#state{repairs=replace_repair(R2, RS)}, timeout()}
     end;
 
 handle_info({'DOWN', _Ref, process, Pid, Reason}, State=#state{handoffs=HS}) ->
     case lists:keytake(Pid,#handoff_status.transport_pid,HS) of
         {value,
-         #handoff_status{modindex={M,I},direction=Dir,vnode_pid=Vnode,
+         #handoff_status{mod_src_tgt={M,_,I}, direction=Dir, vnode_pid=Vnode,
                          origin=Origin}=Handoff,
          NewHS
         } ->
@@ -244,6 +304,12 @@ handle_info({'DOWN', _Ref, process, Pid, Reason}, State=#state{handoffs=HS}) ->
             %% handoff stopped so it can clean up its state
             case WarnVnode andalso is_pid(Vnode) of
                 true ->
+                    case Origin of
+                        none -> ok;
+                        local -> self() ! {handoff_failed, {M, I}, Handoff, Reason};
+                        _ -> {?MODULE, Origin} ! {handoff_failed, {M, I},
+                                                  Handoff, Reason}
+                    end,
                     riak_core_vnode:handoff_error(Vnode,'DOWN',Reason);
                 _ ->
                     case Origin of
@@ -256,18 +322,13 @@ handle_info({'DOWN', _Ref, process, Pid, Reason}, State=#state{handoffs=HS}) ->
             end,
 
             %% removed the handoff from the list of active handoffs
-            {noreply, State#state{handoffs=NewHS}};
+            {noreply, State#state{handoffs=NewHS}, timeout()};
         false ->
-            {noreply, State}
-    end;
-handle_info(Info, State) ->
-    io:format(">>>>> ~w~n", [Info]),
-    {noreply, State}.
-
+            {noreply, State, timeout()}
+    end.
 
 terminate(_Reason, _State) ->
     ok.
-
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
@@ -313,6 +374,8 @@ handoff_concurrency_limit_reached () ->
     ActiveSenders=proplists:get_value(active,Senders),
     get_concurrency_limit() =< (ActiveReceivers + ActiveSenders).
 
+%% @private
+%%
 %% @doc Initiate the repair handoffs for the given `Partition'.
 -spec repair(index(), handoffs()) -> repair().
 repair(Partition, HS) ->
@@ -370,7 +433,7 @@ send_handoff(Mod, {Src, Target}, Node, Filter, Vnode, HS, Origin) ->
             {error, max_concurrency};
         false ->
             ShouldHandoff=
-                case lists:keyfind({Mod, Target},#handoff_status.modindex,HS) of
+                case lists:keyfind({Mod, Src, Target},#handoff_status.mod_src_tgt,HS) of
                     false ->
                         true;
                     Handoff=#handoff_status{node=Node,vnode_pid=Vnode} ->
@@ -398,9 +461,9 @@ send_handoff(Mod, {Src, Target}, Node, Filter, Vnode, HS, Origin) ->
                                           direction=outbound,
                                           timestamp=now(),
                                           node=Node,
-                                          modindex={Mod, Target},
+                                          mod_src_tgt={Mod, Src, Target},
                                           vnode_pid=Vnode,
-                                          status=[],
+                                          status=active,
                                           origin=Origin
                                         }
                     };
@@ -424,13 +487,23 @@ receive_handoff (SSLOpts) ->
             {ok, #handoff_status{ transport_pid=Pid,
                                   direction=inbound,
                                   timestamp=now(),
-                                  modindex={undefined,undefined},
+                                  mod_src_tgt={undefined, undefined, undefined},
                                   node=undefined,
                                   status=[],
                                   origin=none
                                 }
             }
     end.
+
+%% @private
+%%
+%% @doc Get `Timeout'.
+-spec timeout() -> Timeout::pos_integer().
+timeout() ->
+    %% TODO: leaching off vnode_inactivity_timeout, a config probably
+    %% shoudln't be used for the timeout anyways given it's not as
+    %% important for the HO mgr.
+    app_helper:get_env(riak_core, vnode_inactivity_timeout, 60000).
 
 %%
 %% EUNIT tests...
