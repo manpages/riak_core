@@ -207,7 +207,7 @@ handle_cast({add_exclusion, {Mod, Idx}}, State=#state{excl=Excl}) ->
     {noreply, State#state{excl=ordsets:add_element({Mod, Idx}, Excl)},
      timeout()}.
 
-handle_info(timeout, State=#state{handoffs=HS,  repairs=RS}) ->
+handle_info(timeout, State=#state{handoffs=HS, repairs=RS}) ->
     case RS of
         [] ->
             {noreply, State, timeout()};
@@ -226,7 +226,7 @@ handle_info(timeout, State=#state{handoffs=HS,  repairs=RS}) ->
                     MOHS = repair_handoff({Src, SrcOwner}, Target, {CH, NValMap}, HS),
                     R2 = R#repair{minus_one_hs=MOHS},
                     RS2 = replace_repair(R2, RS),
-                    {noreply, State#state{handoffs=HS ++ [MOHS], repairs=RS2}, timeout()};
+                    {noreply, State#state{repairs=RS2}, timeout()};
                true ->
                     if PO#handoff_status.status == needs_retry ->
                             {_M, Src, Target} = PO#handoff_status.mod_src_tgt,
@@ -234,7 +234,7 @@ handle_info(timeout, State=#state{handoffs=HS,  repairs=RS}) ->
                             POHS = repair_handoff({Src, SrcOwner}, Target, {CH, NValMap}, HS),
                             R2 = R#repair{plus_one_hs=POHS},
                             RS2 = replace_repair(R2, RS),
-                            {noreply, State#state{handoffs=HS ++ [POHS], repairs=RS2},
+                            {noreply, State#state{repairs=RS2},
                              timeout()};
                        true ->
                             {noreply, State, timeout()}
@@ -401,7 +401,7 @@ repair(Partition, HS) ->
 %% NOTE: This function assumes it runs on the owner of `Target'.
 -spec repair_handoff({index(), node()}, index(),
                      {chash:chash(), list()}, handoffs()) ->
-                            {ok, handoff_status()}.
+                            handoff_status().
 repair_handoff({Src, SrcOwner}, Target, {CH, NValMap}, HS) ->
     case SrcOwner == node() of
         true ->
