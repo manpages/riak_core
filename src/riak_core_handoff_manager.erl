@@ -36,6 +36,7 @@
 -export([add_outbound/4,
          add_inbound/1,
          add_repair/1,
+         repair_status/1,
          status/0,
          set_concurrency/1,
          kill_handoffs/0
@@ -103,6 +104,13 @@ add_repair(Partition) ->
     Owner = riak_core_ring:index_owner(Ring, Partition),
     gen_server:call({?MODULE, Owner}, {add_repair, Partition}).
 
+%% @doc Get the status of the repair request for `Partition'.
+-spec repair_status(index()) -> no_repair | repair_in_progress.
+repair_status(Partition) ->
+    {ok, Ring} = riak_core_ring_manager:gen_raw_ring(),
+    Owner = riak_core_ring:index_owner(Ring, Partition),
+    gen_server:call({?MODULE, Owner}, {repair_status, Partition}).
+
 status() ->
     gen_server:call(?MODULE,status).
 
@@ -156,6 +164,15 @@ handle_call({add_repair, Partition}, _From, State=#state{handoffs=HS,
             {reply, ok, State2, timeout()};
         #repair{} ->
             {reply, repair_in_progress, State, timeout()}
+    end;
+
+handle_call({repair_status, Partition}, _From, State=#state{repairs=RS}) ->
+    case get_repair(Partition, RS) of
+        %% TODO: keep recently completed repairs around to verify
+        %% completion
+        none -> {reply, no_repair, State, timeout()};
+        %% TODO: more detail on repair in progress
+        #repair{} -> {reply, repair_in_progress, State, timeout()}
     end;
 
 handle_call({send_handoff, Mod, {Src, Target}, Node, {CH, NValMap}},
