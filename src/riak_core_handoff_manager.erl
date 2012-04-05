@@ -107,7 +107,7 @@ add_repair(Partition) ->
 %% @doc Get the status of the repair request for `Partition'.
 -spec repair_status(index()) -> no_repair | repair_in_progress.
 repair_status(Partition) ->
-    {ok, Ring} = riak_core_ring_manager:gen_raw_ring(),
+    {ok, Ring} = riak_core_ring_manager:get_raw_ring(),
     Owner = riak_core_ring:index_owner(Ring, Partition),
     gen_server:call({?MODULE, Owner}, {repair_status, Partition}).
 
@@ -437,7 +437,7 @@ repair_handoff({Src, SrcOwner}, Target, {CH, NValMap}, HS) ->
     end.
 
 send_handoff(Mod, {Src, Target}, Node, Vnode, HS) ->
-    send_handoff(Mod, {Src, Target}, Node, Vnode, none, HS, none).
+    send_handoff(Mod, {Src, Target}, Node, none, Vnode, HS, none).
 
 %% @private
 %%
